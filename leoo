@@ -8,7 +8,7 @@ ARCHIVE="$APP_DIR/percy.rar"
 APP_USER="percy"
 NGINX_CONF="/etc/nginx/conf.d/percy.conf"
 LOG_FILE="/var/log/percy-install.log"
-TOTAL_STEPS=16
+TOTAL_STEPS=17
 STEP=0
 CURRENT_STEP="Khởi tạo"
 
@@ -87,36 +87,39 @@ command -v systemctl >/dev/null || fail 'Không tìm thấy systemctl.'
 command -v apt-get >/dev/null || fail 'Không tìm thấy apt-get.'
 ok 'Đúng Ubuntu 24.04 LTS và đã có percy.rar.'
 
-step 'Cập nhật danh sách gói (apt-get update)'
-apt-get update
+# Bốn lệnh cài môi trường theo yêu cầu.
+# Cần có sudo (mặc định trên Ubuntu 24.04).
+command -v sudo >/dev/null || fail 'Không tìm thấy sudo trên hệ thống.'
+step 'Cập nhật danh sách gói: sudo apt update -y'
+sudo apt update -y
 ok 'Đã cập nhật danh sách gói.'
 
-step 'Nâng cấp gói hệ thống (apt-get upgrade)'
-apt-get upgrade -y
+step 'Nâng cấp hệ thống: sudo apt upgrade -y'
+sudo apt upgrade -y
 ok 'Đã nâng cấp các gói hiện có.'
 
-step 'Cài công cụ cơ bản, Nginx và Certbot'
-apt-get install -y ca-certificates curl wget gnupg software-properties-common git build-essential nginx certbot python3-certbot-nginx
+step 'Cài Nginx: sudo apt install -y nginx'
+sudo apt install -y nginx
 systemctl enable --now nginx
-ok 'Đã cài Nginx, Certbot và công cụ hệ thống.'
+ok 'Đã cài và bật Nginx.'
 
-step 'Bật kho multiverse và cài unrar'
-add-apt-repository -y multiverse
-apt-get update
-apt-get install -y unrar
-ok "Đã cài unrar: $(command -v unrar)"
-
-step 'Cài Node.js 24 LTS và npm (NodeSource)'
-NODE_SETUP="$(mktemp /tmp/percy-nodesource.XXXXXX.sh)"
-curl -fsSL https://deb.nodesource.com/setup_24.x -o "$NODE_SETUP"
-bash "$NODE_SETUP"
-rm -f "$NODE_SETUP"
-apt-get install -y nodejs
+step 'Cài Node.js và npm: sudo apt install -y nodejs npm'
+sudo apt install -y nodejs npm
 command -v node >/dev/null || fail 'Lệnh node không tồn tại sau khi cài.'
 command -v npm >/dev/null || fail 'Lệnh npm không tồn tại sau khi cài.'
 log "Node.js: $(node --version)"
 log "npm: $(npm --version)"
 ok 'Node.js và npm sẵn sàng.'
+
+step 'Cài công cụ cơ bản và Certbot'
+apt install -y ca-certificates curl wget gnupg software-properties-common git build-essential certbot python3-certbot-nginx
+ok 'Đã cài Certbot và công cụ hệ thống.'
+
+step 'Bật kho multiverse và cài unrar'
+add-apt-repository -y multiverse
+apt update -y
+apt install -y unrar
+ok "Đã cài unrar: $(command -v unrar)"
 
 step 'Tạo tài khoản riêng để chạy ứng dụng (không chạy app bằng root)'
 if ! id "$APP_USER" >/dev/null 2>&1; then
@@ -147,7 +150,8 @@ step 'Build dự án: npm run build'
 runuser -u "$APP_USER" -- env HOME="$APP_DIR" npm run build
 ok 'Build dự án thành công.'
 
-step 'Khởi động bằng PM2: npm run start'
+step 'Khởi động bằng PM2 trong /home/percy: npm run start'
+cd "$APP_DIR"
 # Tương đương "pm2 start 'npm run start'" nhưng đúng cú pháp PM2 và có tên process.
 if runuser -u "$APP_USER" -- env HOME="$APP_DIR" pm2 describe percy >/dev/null 2>&1; then
   runuser -u "$APP_USER" -- env HOME="$APP_DIR" pm2 restart percy --update-env
