@@ -23,8 +23,6 @@ else
   exit 1
 fi
 DOMAIN="${DOMAIN,,}"
-# Từ sub.domain.com lấy *.domain.com cho Nginx. SSL chỉ cấp cho sub.domain.com.
-WILDCARD_DOMAIN="*.${DOMAIN#*.}"
 
 valid_domain() {
   [[ ${#DOMAIN} -ge 4 && ${#DOMAIN} -le 253 ]] || return 1
@@ -40,14 +38,6 @@ if ! valid_domain; then
   printf 'LỖI: Domain không hợp lệ: %s (chỉ nhập tên miền đầy đủ, không có https://, / hay *).\n' "$DOMAIN" >&2
   exit 1
 fi
-
-# Nginx nhận mọi subdomain của domain gốc; SSL cấp cho subdomain nhập vào.
-if [[ "${DOMAIN//[^.]/}" != *.* ]]; then
-  printf 'LỖI: Hãy nhập subdomain như sub.domain.com để tạo server_name *.domain.com.\n' >&2
-  exit 1
-fi
-BASE_DOMAIN="${DOMAIN#*.}"
-NGINX_SERVER_NAME="*.$BASE_DOMAIN"
 
 if [[ $EUID -ne 0 ]]; then
   printf 'LỖI: Cần quyền root. Chạy: sudo bash percy-install.sh\n' >&2
@@ -83,8 +73,7 @@ export NEEDRESTART_MODE=a
 export APT_LISTCHANGES_FRONTEND=none
 
 printf '\n========== CÀI ĐẶT PERCY - UBUNTU 24.04 LTS ==========\n'
-log "Domain SSL: $DOMAIN"
-log "Nginx server_name: $WILDCARD_DOMAIN"
+log "Domain: $DOMAIN"
 log "Thư mục dự án: $APP_DIR"
 log "Log cài đặt: $LOG_FILE"
 
@@ -94,3 +83,148 @@ step 'Kiểm tra Ubuntu 24.04, file nén và môi trường'
 source /etc/os-release
 [[ "${ID:-}" == 'ubuntu' && "${VERSION_ID:-}" == '24.04' ]] || fail "Script chỉ dành cho Ubuntu 24.04 LTS (hiện tại: ${PRETTY_NAME:-không xác định})."
 [[ -f "$ARCHIVE" ]] || fail "Không tìm thấy $ARCHIVE. Hãy tải file lên trước khi chạy."
+command -v systemctl >/dev/null || fail 'Không tìm thấy systemctl.'
+command -v apt-get >/dev/null || fail 'Không tìm thấy apt-get.'
+ok 'Đúng Ubuntu 24.04 LTS và đã có percy.rar.'
+
+step 'Cập nhật danh sách gói (apt-get update)'
+apt-get update
+ok 'Đã cập nhật danh sách gói.'
+
+step 'Nâng cấp gói hệ thống (apt-get upgrade)'
+apt-get upgrade -y
+ok 'Đã nâng cấp các gói hiện có.'
+
+step 'Cài công cụ cơ bản, Nginx và Certbot'
+apt-get install -y ca-certificates curl wget gnupg software-properties-common git build-essential nginx certbot python3-certbot-nginx
+systemctl enable --now nginx
+ok 'Đã cài Nginx, Certbot và công cụ hệ thống.'
+
+step 'Bật kho multiverse và cài unrar'
+add-apt-repository -y multiverse
+apt-get update
+apt-get install -y unrar
+ok "Đã cài unrar: $(command -v unrar)"
+
+step 'Cài Node.js 24 LTS và npm (NodeSource)'
+NODE_SETUP="$(mktemp /tmp/percy-nodesource.XXXXXX.sh)"
+curl -fsSL https://deb.nodesource.com/setup_24.x -o "$NODE_SETUP"
+bash "$NODE_SETUP"
+rm -f "$NODE_SETUP"
+apt-get install -y nodejs
+command -v node >/dev/null || fail 'Lệnh node không tồn tại sau khi cài.'
+command -v npm >/dev/null || fail 'Lệnh npm không tồn tại sau khi cài.'
+log "Node.js: $(node --version)"
+log "npm: $(npm --version)"
+ok 'Node.js và npm sẵn sàng.'
+
+step 'Tạo tài khoản riêng để chạy ứng dụng (không chạy app bằng root)'
+if ! id "$APP_USER" >/dev/null 2>&1; then
+  useradd --system --user-group --no-create-home --home-dir "$APP_DIR" --shell /usr/sbin/nologin "$APP_USER"
+fi
+mkdir -p "$APP_DIR"
+chown -R "$APP_USER:$(id -gn "$APP_USER")" "$APP_DIR"
+ok "Ứng dụng sẽ chạy bằng tài khoản $APP_USER."
+
+step 'Giải nén /home/percy/percy.rar vào /home/percy'
+# -o+ tự ghi đè file trùng tên; -y tự trả lời Yes cho unrar.
+runuser -u "$APP_USER" -- unrar x -o+ -y "$ARCHIVE" "$APP_DIR/"
+[[ -f "$APP_DIR/package.json" ]] || fail "Không có $APP_DIR/package.json sau giải nén. Kiểm tra cấu trúc percy.rar (package.json phải nằm trực tiếp trong /home/percy)."
+ok 'Giải nén thành công và đã tìm thấy package.json.'
+
+cd "$APP_DIR"
+step 'Cài dependency: cd /home/percy && npm i'
+runuser -u "$APP_USER" -- env HOME="$APP_DIR" npm i
+ok 'npm i hoàn tất.'
+
+step 'Cài PM2 toàn hệ thống: npm i pm2 -g'
+npm i pm2 -g
+log "PM2: $(pm2 --version)"
+ok 'Đã cài PM2.'
+
+step 'Build dự án: npm run build'
+runuser -u "$APP_USER" -- env HOME="$APP_DIR" npm run build
+ok 'Build dự án thành công.'
+
+step 'Khởi động bằng PM2: npm run start'
+# Tương đương "pm2 start 'npm run start'" nhưng đúng cú pháp PM2 và có tên process.
+if runuser -u "$APP_USER" -- env HOME="$APP_DIR" pm2 describe percy >/dev/null 2>&1; then
+  runuser -u "$APP_USER" -- env HOME="$APP_DIR" pm2 restart percy --update-env
+else
+  runuser -u "$APP_USER" -- env HOME="$APP_DIR" pm2 start npm --name percy -- run start
+fi
+runuser -u "$APP_USER" -- env HOME="$APP_DIR" pm2 save
+pm2 startup systemd -u "$APP_USER" --hp "$APP_DIR"
+ok 'PM2 đã chạy và cấu hình tự khởi động khi reboot.'
+
+step 'Tạo cấu hình Nginx: /etc/nginx/conf.d/percy.conf'
+mkdir -p /etc/nginx/conf.d
+if [[ -f "$NGINX_CONF" ]]; then
+  BACKUP="${NGINX_CONF}.bak.$(date +%Y%m%d-%H%M%S)"
+  cp -a "$NGINX_CONF" "$BACKUP"
+  log "Đã sao lưu cấu hình cũ: $BACKUP"
+fi
+cat > "$NGINX_CONF" <<NGINX
+server {
+    listen 80;
+    server_name $DOMAIN;
+
+    location / {
+        proxy_pass http://localhost:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host \$host;
+        proxy_cache_bypass \$http_upgrade;
+    }
+
+    error_page 404 /index.html;
+}
+NGINX
+nginx -t
+ok "Đã tạo Nginx config cho $DOMAIN -> localhost:3000."
+
+step 'Khởi động lại Nginx và cấu hình firewall nếu UFW đang bật'
+if command -v ufw >/dev/null 2>&1 && ufw status | grep -q '^Status: active'; then
+  ufw allow 'Nginx Full'
+  log 'Đã cho phép cổng HTTP/HTTPS trong UFW.'
+fi
+systemctl restart nginx
+systemctl is-active --quiet nginx || fail 'Nginx chưa chạy.'
+ok 'Nginx hoạt động bình thường.'
+
+step 'Cấp SSL miễn phí bằng Certbot (tự đồng ý điều khoản)'
+# Địa chỉ ngẫu nhiên theo yêu cầu. Nên thay bằng email thật để nhận thông báo quan trọng.
+EMAIL="$(od -An -N4 -tx1 /dev/urandom | tr -d '[:space:]')@gmail.com"
+log "Email đăng ký Certbot (tạo ngẫu nhiên): $EMAIL"
+warn 'Email ngẫu nhiên có thể không nhận được thông báo về chứng chỉ. Nên dùng email thật về lâu dài.'
+if getent ahosts "$DOMAIN" >/dev/null 2>&1; then
+  log "DNS của $DOMAIN có phân giải; bắt đầu xác thực với Let's Encrypt."
+else
+  warn "DNS của $DOMAIN chưa phân giải từ VPS này. Bạn cần trỏ A/AAAA về VPS trước khi cấp SSL."
+fi
+# Không đặt 'yes |' vì --non-interactive và --agree-tos đã xử lý câu hỏi Yes/Agree.
+certbot --nginx --non-interactive --agree-tos --no-eff-email --redirect -m "$EMAIL" -d "$DOMAIN"
+ok "Đã cài SSL cho https://$DOMAIN và chuyển HTTP -> HTTPS."
+
+step 'Kiểm tra cuối, restart Nginx và bật tự gia hạn SSL'
+nginx -t
+systemctl restart nginx
+if systemctl list-unit-files certbot.timer --no-legend 2>/dev/null | grep -q 'certbot.timer'; then
+  systemctl enable --now certbot.timer
+  log 'Đã bật certbot.timer để tự gia hạn chứng chỉ.'
+else
+  warn 'Không tìm thấy certbot.timer; hãy kiểm tra cơ chế tự gia hạn Certbot.'
+fi
+systemctl --no-pager --full status nginx | sed -n '1,8p' || true
+runuser -u "$APP_USER" -- env HOME="$APP_DIR" pm2 list
+ok 'Toàn bộ bước cài đặt đã hoàn thành.'
+
+printf '\n=============================================================\n'
+printf ' HOÀN TẤT CÀI ĐẶT PERCY\n'
+printf ' Website : https://%s\n' "$DOMAIN"
+printf ' App     : %s\n' "$APP_DIR"
+printf ' Nginx   : %s\n' "$NGINX_CONF"
+printf ' Log     : %s\n' "$LOG_FILE"
+printf ' SSL mail: %s (ngẫu nhiên; nên thay email thật)\n' "$EMAIL"
+printf '=============================================================\n'
