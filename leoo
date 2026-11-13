@@ -1,1 +1,96 @@
+#!/usr/bin/env bash
+# Triển khai Percy trên Ubuntu 24.04 LTS
+# Chạy: sudo bash percy-install.sh  (hoặc: sudo bash percy-install.sh sub.example.com)
+set -Eeuo pipefail
 
+APP_DIR="/home/percy"
+ARCHIVE="$APP_DIR/percy.rar"
+APP_USER="percy"
+NGINX_CONF="/etc/nginx/conf.d/percy.conf"
+LOG_FILE="/var/log/percy-install.log"
+TOTAL_STEPS=16
+STEP=0
+CURRENT_STEP="Khởi tạo"
+
+# Đọc từ /dev/tty để vẫn nhập được domain khi dùng: curl ... | sudo bash
+if [[ $# -ge 1 ]]; then
+  DOMAIN="${1}"
+elif [[ -r /dev/tty ]]; then
+  printf '\nNhập domain/subdomain (ví dụ: sub.domain.com): ' > /dev/tty
+  IFS= read -r DOMAIN < /dev/tty
+else
+  printf 'LỖI: Không có terminal để nhập domain. Hãy chạy: sudo bash percy-install.sh sub.domain.com\n' >&2
+  exit 1
+fi
+DOMAIN="${DOMAIN,,}"
+# Từ sub.domain.com lấy *.domain.com cho Nginx. SSL chỉ cấp cho sub.domain.com.
+WILDCARD_DOMAIN="*.${DOMAIN#*.}"
+
+valid_domain() {
+  [[ ${#DOMAIN} -ge 4 && ${#DOMAIN} -le 253 ]] || return 1
+  [[ $DOMAIN =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]] || return 1
+  local part
+  local -a parts
+  IFS='.' read -r -a parts <<< "$DOMAIN"
+  for part in "${parts[@]}"; do
+    [[ ${#part} -le 63 ]] || return 1
+  done
+}
+if ! valid_domain; then
+  printf 'LỖI: Domain không hợp lệ: %s (chỉ nhập tên miền đầy đủ, không có https://, / hay *).\n' "$DOMAIN" >&2
+  exit 1
+fi
+
+# Nginx nhận mọi subdomain của domain gốc; SSL cấp cho subdomain nhập vào.
+if [[ "${DOMAIN//[^.]/}" != *.* ]]; then
+  printf 'LỖI: Hãy nhập subdomain như sub.domain.com để tạo server_name *.domain.com.\n' >&2
+  exit 1
+fi
+BASE_DOMAIN="${DOMAIN#*.}"
+NGINX_SERVER_NAME="*.$BASE_DOMAIN"
+
+if [[ $EUID -ne 0 ]]; then
+  printf 'LỖI: Cần quyền root. Chạy: sudo bash percy-install.sh\n' >&2
+  exit 1
+fi
+
+mkdir -p "$(dirname "$LOG_FILE")"
+touch "$LOG_FILE"
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+log()  { printf '[INFO] %s\n' "$*"; }
+ok()   { printf '[OK]   %s\n' "$*"; }
+warn() { printf '[CẢNH BÁO] %s\n' "$*"; }
+fail() { printf '[LỖI] %s\n' "$*" >&2; exit 1; }
+step() {
+  STEP=$((STEP + 1))
+  CURRENT_STEP="$1"
+  printf '\n================================================================\n'
+  printf '[BƯỚC %02d/%02d] %s\n' "$STEP" "$TOTAL_STEPS" "$CURRENT_STEP"
+  printf '================================================================\n'
+}
+error_handler() {
+  local status=$?
+  trap - ERR
+  printf '\n[LỖI] Dừng ở bước %02d/%02d: %s\n' "$STEP" "$TOTAL_STEPS" "$CURRENT_STEP" >&2
+  printf '[LỖI] Dòng %s, mã lỗi: %s. Xem log: %s\n' "${BASH_LINENO[0]:-?}" "$status" "$LOG_FILE" >&2
+  exit "$status"
+}
+trap error_handler ERR
+
+export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a
+export APT_LISTCHANGES_FRONTEND=none
+
+printf '\n========== CÀI ĐẶT PERCY - UBUNTU 24.04 LTS ==========\n'
+log "Domain SSL: $DOMAIN"
+log "Nginx server_name: $WILDCARD_DOMAIN"
+log "Thư mục dự án: $APP_DIR"
+log "Log cài đặt: $LOG_FILE"
+
+step 'Kiểm tra Ubuntu 24.04, file nén và môi trường'
+[[ -r /etc/os-release ]] || fail 'Không tìm thấy /etc/os-release.'
+# shellcheck disable=SC1091
+source /etc/os-release
+[[ "${ID:-}" == 'ubuntu' && "${VERSION_ID:-}" == '24.04' ]] || fail "Script chỉ dành cho Ubuntu 24.04 LTS (hiện tại: ${PRETTY_NAME:-không xác định})."
+[[ -f "$ARCHIVE" ]] || fail "Không tìm thấy $ARCHIVE. Hãy tải file lên trước khi chạy."
