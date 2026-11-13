@@ -130,7 +130,8 @@ step 'Giải nén /home/percy/percy.rar vào /home/percy'
 # -o+ tự ghi đè file trùng tên; -y tự trả lời Yes cho unrar.
 runuser -u "$APP_USER" -- unrar x -o+ -y "$ARCHIVE" "$APP_DIR/"
 [[ -f "$APP_DIR/package.json" ]] || fail "Không có $APP_DIR/package.json sau giải nén. Kiểm tra cấu trúc percy.rar (package.json phải nằm trực tiếp trong /home/percy)."
-ok 'Giải nén thành công và đã tìm thấy package.json.'
+rm -- "$ARCHIVE"
+ok 'Giải nén thành công, đã tìm thấy package.json và đã xóa percy.rar.'
 
 cd "$APP_DIR"
 step 'Cài dependency: cd /home/percy && npm i'
